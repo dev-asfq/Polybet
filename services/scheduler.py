@@ -11,9 +11,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram.ext import Application
 from telegram.error import TelegramError
 
-from services.arbitrage import find_all_arb
+from services.arbitrage  import find_all_arb
 from services.polymarket import get_all_signals
-from services.insider import get_all_insider_signals
+from services.insider    import get_all_insider_signals
 from utils.database import all_users
 from utils.formatting import usd, cents, pct, score_emoji, trunc, div
 

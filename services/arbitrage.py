@@ -1,13 +1,6 @@
 """
-Cross-Platform Arbitrage Engine
-Finds pricing discrepancies between Polymarket and Kalshi
-on the same real-world events.
-
-Arb types:
-  1. Direct Cross-Platform  — same event, YES cheaper on one platform
-  2. Sum Deviation          — YES + NO ≠ 1.0 on a single platform
-  3. Correlated Market Arb  — logically linked events priced inconsistently
-  4. Spread Scalping        — wide bid/ask spread = market-making opportunity
+Cross-Platform Arbitrage Engine — FIXED
+Uses updated polymarket.py and kalshi.py service functions.
 """
 
 import asyncio
@@ -17,11 +10,10 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timezone
 
 from services.polymarket import get_active_markets as poly_markets
-from services.kalshi import get_active_markets as kalshi_markets
+from services.kalshi     import get_active_markets as kalshi_markets
 
 logger = logging.getLogger(__name__)
 
-# Keywords that help us match the same event across platforms
 TOPIC_KEYWORDS = [
     ["bitcoin", "btc"],
     ["ethereum", "eth"],
@@ -35,17 +27,19 @@ TOPIC_KEYWORDS = [
     ["gdp"],
     ["nba", "basketball"],
     ["nfl", "football", "super bowl"],
-    ["world cup", "soccer", "football"],
+    ["world cup", "soccer"],
     ["ukraine", "russia"],
     ["china", "taiwan"],
     ["oil", "crude", "opec"],
     ["gold"],
     ["nasdaq", "s&p", "dow"],
+    ["climate", "temperature", "weather"],
+    ["oscar", "emmy", "grammy"],
+    ["spacex", "nasa", "rocket"],
 ]
 
 
 def _topic_key(question: str) -> Optional[str]:
-    """Return the first matching topic keyword group for a question."""
     q = question.lower()
     for group in TOPIC_KEYWORDS:
         if any(kw in q for kw in group):
@@ -54,11 +48,6 @@ def _topic_key(question: str) -> Optional[str]:
 
 
 def _match_markets(poly: List[Dict], kalshi: List[Dict]) -> List[Tuple[Dict, Dict]]:
-    """
-    Attempt fuzzy matching between Polymarket and Kalshi markets
-    on the same real-world event using topic keywords.
-    Returns list of (poly_market, kalshi_market) pairs.
-    """
     pairs = []
     kalshi_by_topic: Dict[str, List[Dict]] = {}
     for km in kalshi:
@@ -66,48 +55,51 @@ def _match_markets(poly: List[Dict], kalshi: List[Dict]) -> List[Tuple[Dict, Dic
         if key:
             kalshi_by_topic.setdefault(key, []).append(km)
 
+    seen_kal = set()
     for pm in poly:
         key = _topic_key(pm["question"])
         if not key or key not in kalshi_by_topic:
             continue
-        # Pick the Kalshi market with most volume in same topic
-        best = max(kalshi_by_topic[key], key=lambda x: x.get("volume", 0))
+        # Pick highest-volume Kalshi market in same topic
+        candidates = [k for k in kalshi_by_topic[key] if k["id"] not in seen_kal]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda x: x.get("volume", 0))
+        seen_kal.add(best["id"])
         pairs.append((pm, best))
 
     return pairs
 
 
-# ── Arb finders ──────────────────────────────────────────────────────────────
+# ── Arb finders ───────────────────────────────────────────────────────────────
 
 def find_cross_platform_arb(pairs: List[Tuple[Dict, Dict]]) -> List[Dict]:
     """
-    If YES is cheaper on Polymarket and NO is cheaper on Kalshi for the
-    same event, you can buy both and guarantee a profit when it resolves.
-
-    Net profit = (1 - poly_yes - kalshi_no)  or  (1 - kalshi_yes - poly_no)
+    Best case: buy YES on one platform + NO on the other for < $1.
+    Guaranteed $1 at resolution. Net profit = 1 - total_cost.
     """
     opps = []
     for pm, km in pairs:
         # Side 1: YES on Poly, NO on Kalshi
-        cost1 = pm["yes"] + km["no"]
+        cost1   = pm["yes"] + km["no"]
         profit1 = 1.0 - cost1
 
         # Side 2: YES on Kalshi, NO on Poly
-        cost2 = km["yes"] + pm["no"]
+        cost2   = km["yes"] + pm["no"]
         profit2 = 1.0 - cost2
 
         best_profit = max(profit1, profit2)
-        if best_profit < 0.015:   # < 1.5% not worth it after fees
+        if best_profit < 0.015:
             continue
 
         if profit1 >= profit2:
-            action = f"BUY YES on Polymarket ({pm['yes']:.2f}¢) + BUY NO on Kalshi ({km['no']:.2f}¢)"
-            poly_side, kal_side = "YES", "NO"
-            poly_price, kal_price = pm["yes"], km["no"]
+            action     = f"BUY YES on Polymarket ({int(pm['yes']*100)}c) + BUY NO on Kalshi ({int(km['no']*100)}c)"
+            poly_side  = "YES";  kal_side  = "NO"
+            poly_price = pm["yes"]; kal_price = km["no"]
         else:
-            action = f"BUY YES on Kalshi ({km['yes']:.2f}¢) + BUY NO on Polymarket ({pm['no']:.2f}¢)"
-            poly_side, kal_side = "NO", "YES"
-            poly_price, kal_price = pm["no"], km["yes"]
+            action     = f"BUY YES on Kalshi ({int(km['yes']*100)}c) + BUY NO on Polymarket ({int(pm['no']*100)}c)"
+            poly_side  = "NO";   kal_side  = "YES"
+            poly_price = pm["no"]; kal_price = km["yes"]
 
         opps.append({
             "arb_type":       "Cross-Platform",
@@ -138,10 +130,7 @@ def find_cross_platform_arb(pairs: List[Tuple[Dict, Dict]]) -> List[Dict]:
 
 
 def find_sum_deviation_arb(poly: List[Dict], kalshi: List[Dict]) -> List[Dict]:
-    """
-    Single-platform arb: YES + NO ≠ 1.0
-    Buy BOTH sides for < $1, guaranteed $1 back.
-    """
+    """YES + NO != 1.0 on a single platform = guaranteed profit."""
     opps = []
 
     def check(markets: List[Dict], platform: str):
@@ -156,18 +145,18 @@ def find_sum_deviation_arb(poly: List[Dict], kalshi: List[Dict]) -> List[Dict]:
             if profit_pct < 1.5:
                 continue
             opps.append({
-                "arb_type":    "Sum Deviation",
-                "platform":    platform,
-                "question":    m["question"],
-                "yes":         yes,
-                "no":          no,
-                "sum":         round(total, 4),
-                "profit_pct":  round(profit_pct, 2),
-                "action":      "BUY YES + BUY NO" if dev < 0 else "SELL YES + SELL NO (short both)",
-                "url":         m.get("url", ""),
-                "liquidity":   m.get("liquidity", 0),
-                "confidence":  min(95, int(45 + profit_pct * 12)),
-                "score":       min(99, int(45 + profit_pct * 12)),
+                "arb_type":   "Sum Deviation",
+                "platform":   platform,
+                "question":   m.get("question", "?"),
+                "yes":        yes,
+                "no":         no,
+                "sum":        round(total, 4),
+                "profit_pct": round(profit_pct, 2),
+                "action":     "BUY YES + BUY NO" if dev < 0 else "SELL YES + SELL NO",
+                "url":        m.get("url", ""),
+                "liquidity":  m.get("liquidity", 0),
+                "confidence": min(95, int(45 + profit_pct * 12)),
+                "score":      min(99, int(45 + profit_pct * 12)),
             })
 
     check(poly,   "Polymarket")
@@ -177,32 +166,27 @@ def find_sum_deviation_arb(poly: List[Dict], kalshi: List[Dict]) -> List[Dict]:
 
 
 def find_spread_opportunities(kalshi: List[Dict]) -> List[Dict]:
-    """
-    Wide bid/ask spreads = market-making opportunity.
-    Post limit orders inside the spread to collect the edge.
-    (Kalshi exposes bid/ask; Polymarket CLOB also has spreads.)
-    """
+    """Wide Kalshi bid/ask spreads = market-making opportunity."""
     opps = []
     for m in kalshi:
         spread = m.get("spread")
-        if spread is None or spread < 0.03:   # < 3¢ spread not juicy
+        if spread is None or spread < 0.03:
             continue
         mid = (m["yes_bid"] + m["yes_ask"]) / 2
         opps.append({
-            "arb_type":  "Spread / Market Making",
-            "platform":  "Kalshi",
-            "question":  m["question"],
-            "yes_bid":   m["yes_bid"],
-            "yes_ask":   m["yes_ask"],
-            "spread":    round(spread * 100, 1),
-            "mid":       round(mid * 100, 1),
-            "action":    f"Post YES bid at {int(m['yes_bid']*100+1)}¢, YES ask at {int(m['yes_ask']*100-1)}¢",
-            "url":       m.get("url", ""),
-            "volume":    m.get("volume", 0),
-            "score":     min(99, int(40 + spread * 400)),
+            "arb_type": "Spread / Market Making",
+            "platform": "Kalshi",
+            "question": m["question"],
+            "yes_bid":  m["yes_bid"],
+            "yes_ask":  m["yes_ask"],
+            "spread":   round(spread * 100, 1),
+            "mid":      round(mid * 100, 1),
+            "action":   f"Post YES bid at {int(m['yes_bid']*100+1)}c, YES ask at {int(m['yes_ask']*100-1)}c",
+            "url":      m.get("url", ""),
+            "volume":   m.get("volume", 0),
+            "score":    min(99, int(40 + spread * 400)),
             "confidence": min(90, int(40 + spread * 300)),
         })
-
     opps.sort(key=lambda x: x["spread"], reverse=True)
     return opps[:6]
 
@@ -210,30 +194,36 @@ def find_spread_opportunities(kalshi: List[Dict]) -> List[Dict]:
 # ── Master runner ─────────────────────────────────────────────────────────────
 
 async def find_all_arb() -> Dict:
-    """Run all arb detectors concurrently."""
     poly_data, kal_data = await asyncio.gather(
         poly_markets(300),
         kalshi_markets(200),
         return_exceptions=True
     )
 
-    poly   = poly_data   if not isinstance(poly_data,  Exception) else []
-    kalshi = kal_data    if not isinstance(kal_data,   Exception) else []
+    poly   = poly_data  if not isinstance(poly_data,  Exception) else []
+    kalshi = kal_data   if not isinstance(kal_data,   Exception) else []
+
+    if isinstance(poly_data, Exception):
+        logger.error(f"Polymarket fetch error: {poly_data}")
+    if isinstance(kal_data, Exception):
+        logger.error(f"Kalshi fetch error: {kal_data}")
 
     pairs          = _match_markets(poly, kalshi)
     cross_platform = find_cross_platform_arb(pairs)
     sum_dev        = find_sum_deviation_arb(poly, kalshi)
     spreads        = find_spread_opportunities(kalshi)
 
-    total = len(cross_platform) + len(sum_dev) + len(spreads)
-
     return {
-        "cross_platform":     cross_platform,
-        "sum_deviation":      sum_dev,
-        "spread_making":      spreads,
-        "matched_pairs":      len(pairs),
-        "poly_markets":       len(poly),
-        "kalshi_markets":     len(kalshi),
-        "total_opportunities": total,
-        "timestamp":          datetime.now(timezone.utc).isoformat(),
+        "cross_platform":      cross_platform,
+        "sum_deviation":       sum_dev,
+        "spread_making":       spreads,
+        "matched_pairs":       len(pairs),
+        "poly_markets":        len(poly),
+        "kalshi_markets":      len(kalshi),
+        "total_opportunities": len(cross_platform) + len(sum_dev) + len(spreads),
+        "timestamp":           datetime.now(timezone.utc).isoformat(),
+        "errors": {
+            "poly":   str(poly_data)   if isinstance(poly_data,  Exception) else None,
+            "kalshi": str(kal_data)    if isinstance(kal_data,   Exception) else None,
+        }
     }

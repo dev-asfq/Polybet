@@ -25,7 +25,11 @@ async def bets_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     signals = await get_all_signals()
 
     if signals.get("error"):
-        await q.edit_message_text("❌ Could not reach Polymarket API. Try again shortly.")
+        err = signals.get("error", "Unknown error")
+        await q.edit_message_text(
+            f"❌ *Polymarket Error*\n\n_{err}_\n\nTry again in ~30 seconds.",
+            parse_mode="Markdown"
+        )
         return
 
     mode = q.data
